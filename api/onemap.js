@@ -1,37 +1,30 @@
-// api/onemap.js  (Vercel serverless function for the 3d-mapper project)
-// Same style as your ura proxy (CommonJS), but uses Node's built-in fetch,
-// so it needs no node-fetch and no package.json.
+// api/onemap.js  (Vercel serverless function for the Estates3d project)
 //
-// Env vars to set in Vercel -> Settings -> Environment Variables (use ONE option):
-//   Option A: ONEMAP_TOKEN                       a ready-made OneMap API token
-//   Option B: ONEMAP_EMAIL + ONEMAP_PASSWORD     your OneMap account login
-// Never put these in the code or in the repo.
+// Built from how your working ura-condo-research proxy does it:
+//  - action=search  : OneMap's address search needs NO login, so no password is used at all.
+//  - action=revgeo  : coordinates -> address. This one needs a token, so it logs in with the
+//                     ONEMAP_EMAIL / ONEMAP_PASSWORD saved in Vercel (optional; skip if you
+//                     don't need it). Nothing secret is ever returned to the page.
 
 const ALLOWED = [
-  'https://3d-mapper-azure.vercel.app',
-  'https://rodericktyler.github.io',
+  'https://estates3d.vercel.app',        // new Vercel project (change if Vercel gives you a different address)
+  'https://rodericktyler.github.io',     // GitHub Pages (any repo under this account)
 ];
 
 let cache = { token: null, exp: 0 };
 
 async function getToken() {
-  // Option A: a ready-made token saved in Vercel as ONEMAP_TOKEN (expires after about 3 days; replace it when it does)
-  if (process.env.ONEMAP_TOKEN) return process.env.ONEMAP_TOKEN;
-  // Option B: email + password, so the function fetches fresh tokens by itself
-  // reuse the token until about an hour before it expires
   if (cache.token && Date.now() < cache.exp - 3600e3) return cache.token;
+  const email = (process.env.ONEMAP_EMAIL || '').trim();
+  const password = (process.env.ONEMAP_PASSWORD || '').trim();
+  if (!email || !password) throw new Error('login not configured');
   const r = await fetch('https://www.onemap.gov.sg/api/auth/post/getToken', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      email: process.env.ONEMAP_EMAIL,
-      password: process.env.ONEMAP_PASSWORD,
-    }),
+    body: JSON.stringify({ email, password }),
   });
-  const text = await r.text();
-  let d = {};
-  try { d = JSON.parse(text); } catch (e) { /* not JSON */ }
-  if (!d.access_token) throw new Error('OneMap login failed. HTTP ' + r.status + '. Reply: ' + text.slice(0, 200));
+  const d = await r.json();
+  if (!d.access_token) throw new Error('login rejected by OneMap');
   cache = { token: d.access_token, exp: Number(d.expiry_timestamp) * 1000 };
   return cache.token;
 }
@@ -45,37 +38,32 @@ module.exports = async (req, res) => {
 
   try {
     const { action, q, lat, lng } = req.query;
-    let url;
 
     if (action === 'search') {
-      if (!q || String(q).length > 100) return res.status(400).json({ error: 'bad query' });
-      url =
+      if (!q || String(q).length > 100) return res.status(400).json({ Status: 'Failure', Message: 'q required' });
+      const r = await fetch(
         'https://www.onemap.gov.sg/api/common/elastic/search' +
-        `?searchVal=${encodeURIComponent(q)}&returnGeom=Y&getAddrDetails=Y&pageNum=1`;
-    } else if (action === 'revgeo') {
-      const la = Number(lat), ln = Number(lng);
-      if (!isFinite(la) || !isFinite(ln)) return res.status(400).json({ error: 'bad coordinates' });
-      url =
-        'https://www.onemap.gov.sg/api/public/revgeocode' +
-        `?location=${la},${ln}&buffer=40&addressType=All&otherFeatures=N`;
-    } else {
-      return res.status(400).json({ error: 'unknown action' });
+        `?searchVal=${encodeURIComponent(q)}&returnGeom=Y&getAddrDetails=Y&pageNum=1`
+      );
+      res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate');
+      return res.json({ Status: 'Success', Result: await r.json() });
     }
 
-    const r = await fetch(url, { headers: { Authorization: await getToken() } });
-    const data = await r.json();
-    res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate');
-    return res.status(r.status).json(data);
+    if (action === 'revgeo') {
+      const la = Number(lat), ln = Number(lng);
+      if (!isFinite(la) || !isFinite(ln)) return res.status(400).json({ Status: 'Failure', Message: 'lat/lng required' });
+      const t = await getToken();
+      const r = await fetch(
+        `https://www.onemap.gov.sg/api/public/revgeocode?location=${la},${ln}&buffer=40&addressType=All&otherFeatures=N`,
+        { headers: { Authorization: t } }
+      );
+      res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate');
+      return res.json({ Status: 'Success', Result: await r.json() });
+    }
+
+    return res.status(400).json({ Status: 'Failure', Message: 'Unknown action' });
   } catch (e) {
-    console.error('onemap error:', e.message);
-    // TEMPORARY DEBUG: shows the reason in the browser. Never includes your password. Remove once it works.
-    return res.status(502).json({
-      error: 'upstream failed',
-      reason: e.message,
-      emailSet: !!process.env.ONEMAP_EMAIL,
-      passwordSet: !!process.env.ONEMAP_PASSWORD,
-      tokenSet: !!process.env.ONEMAP_TOKEN,
-      node: process.version,
-    });
+    console.error('onemap error:', e.message);   // visible only in Vercel Logs
+    return res.status(502).json({ Status: 'Failure', Message: 'upstream failed' });
   }
 };
